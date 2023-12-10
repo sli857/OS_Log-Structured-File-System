@@ -68,15 +68,15 @@ struct wfs_log_entry *get_log_entry(int inode_number)
 
 struct wfs_dentry *get_dentry(struct wfs_log_entry *entry, const char *name)
 {
-    int numDentries = entry->inode.size / sizeof(struct wfs_dentry);
-    if (numDentries == 0)
+    int numDE = entry->inode.size / sizeof(struct wfs_dentry);
+    if (numDE == 0)
     {
         return NULL;
     }
     struct wfs_dentry *currDentry = (struct wfs_dentry *)entry->data;
 
     // Iterate over each directory entry
-    for (int i = 0; i < numDentries; i++)
+    for (int i = 0; i < numDE; i++)
     {
         if (strcmp(currDentry->name, name) == 0)
         {
@@ -91,13 +91,13 @@ struct wfs_inode *get_inode_by_path(const char *path)
 {
 
     struct wfs_log_entry *logEntry = get_log_entry(0);
-    char *dup_path = strdup(path);
-    char *token = strtok(dup_path, "/");
+    char *copied_path = strdup(path);
+    char *token = strtok(copied_path, "/");
 
     while (token)
     {
-        int numDentries = logEntry->inode.size / sizeof(struct wfs_dentry);
-        if (numDentries == 0)
+        int numDE = logEntry->inode.size / sizeof(struct wfs_dentry);
+        if (numDE == 0)
             return NULL;
 
         struct wfs_dentry *currDentry = get_dentry(logEntry, token);
@@ -150,8 +150,8 @@ static int wfs_mknod(const char *path, mode_t mode, dev_t rdev)
     }
 
     struct wfs_sb *sb = (struct wfs_sb *)mapped_disk;
-    struct wfs_log_entry *newLogEntry = (struct wfs_log_entry *)((char *)mapped_disk + sb->head);
-    struct wfs_inode *newInode = &newLogEntry->inode;
+    struct wfs_log_entry *new_log_entry = (struct wfs_log_entry *)((char *)mapped_disk + sb->head);
+    struct wfs_inode *new_inode = &new_log_entry->inode;
     int nextInode = -1;
     int nextInodeNum = 1;
 
@@ -182,70 +182,72 @@ static int wfs_mknod(const char *path, mode_t mode, dev_t rdev)
         }
         nextInodeNum++;
     }
-    newInode->inode_number = nextInode;
-    newInode->deleted = 0;
-    newInode->mode = mode;
+    new_inode->inode_number = nextInode;
+    new_inode->deleted = 0;
+    new_inode->mode = mode;
     struct fuse_context *fuse = fuse_get_context();
-    newInode->uid = fuse->uid;
-    newInode->gid = fuse->gid;
-    newInode->flags = 0;
-    newInode->size = 0;
-    newInode->atime = time(NULL);
-    newInode->mtime = time(NULL);
-    newInode->ctime = time(NULL);
-    newInode->links = 1;
+    new_inode->uid = fuse->uid;
+    new_inode->gid = fuse->gid;
+    new_inode->flags = 0;
+    new_inode->size = 0;
+    new_inode->atime = time(NULL);
+    new_inode->mtime = time(NULL);
+    new_inode->ctime = time(NULL);
+    new_inode->links = 1;
 
     // Update superblock and disk image size
     sb->head += sizeof(struct wfs_inode);
     mapped_size += sizeof(struct wfs_inode);
 
-    char *copyOfPath = strdup(path);
-    char dirPath[MAX_PATH_LEN] = "/";
-    char *token = strtok(copyOfPath, "/");
-    char last[MAX_FILE_NAME_LEN] = "";
+    char *copied_path = strdup(path);           // Duplicate the original path
+    char parent_path[MAX_PATH_LEN] = "/";       // Initialize the parent directory path as root
+    char *token = strtok(copied_path, "/");     // Tokenize the copied path with '/' as the delimiter
+    char last_token[MAX_FILE_NAME_LEN] = ""; // Initialize the last segment of the path as an empty string
+
     if (token)
     {
-        strncpy(last, token, MAX_FILE_NAME_LEN - 1);
+        strncpy(last_token, token, MAX_FILE_NAME_LEN - 1); // Copy the first token to last_token
     }
+
     while (token)
     {
-        token = strtok(NULL, "/");
+        token = strtok(NULL, "/"); // Continue tokenizing the path
         if (token != NULL)
         {
-            strncat(dirPath, last, MAX_PATH_LEN - strlen(dirPath) - 1);
-            strncat(dirPath, "/", MAX_PATH_LEN - strlen(dirPath) - 1);
-            strncpy(last, token, MAX_FILE_NAME_LEN - 1);
+            strncat(parent_path, last_token, MAX_PATH_LEN - strlen(parent_path) - 1); // Append the previous token to parent_path
+            strncat(parent_path, "/", MAX_PATH_LEN - strlen(parent_path) - 1);           // Append a '/' to parent_path
+            strncpy(last_token, token, MAX_FILE_NAME_LEN - 1);                        // Copy the current token to last_token
         }
     }
 
-    struct wfs_log_entry *oldDirEntry = (strcmp(dirPath, "/") == 0) ? get_log_entry(0) : get_log_entry(get_inode_by_path(dirPath)->inode_number);
+    struct wfs_log_entry *old_dir_entry = (strcmp(parent_path, "/") == 0) ? get_log_entry(0) : get_log_entry(get_inode_by_path(parent_path)->inode_number);
+    struct wfs_inode *old_dir_inode = &old_dir_entry->inode;
 
-    struct wfs_inode *oldDirInode = &oldDirEntry->inode;
-    struct wfs_log_entry *newDirEntry = (struct wfs_log_entry *)((char *)mapped_disk + sb->head);
-    struct wfs_inode *newDirInode = &newDirEntry->inode;
-    copy_data(newDirInode, oldDirInode, 1);
+    struct wfs_log_entry *new_dir_entry = (struct wfs_log_entry *)((char *)mapped_disk + sb->head);
+    struct wfs_inode *new_dir_inode = &new_dir_entry->inode;
 
-    // Copy directory entries excluding the deleted one
-    int numDentries = oldDirInode->size / sizeof(struct wfs_dentry);
-    struct wfs_dentry *currDentry = (struct wfs_dentry *)oldDirEntry->data;
-    struct wfs_dentry *newCurrDentry = (struct wfs_dentry *)newDirEntry->data;
-    for (int i = 0; i < numDentries; i++)
+    copy_data(new_dir_inode, old_dir_inode, 1);
+
+    int numDE = old_dir_inode->size / sizeof(struct wfs_dentry);
+    struct wfs_dentry *currDE = (struct wfs_dentry *)old_dir_entry->data;
+    struct wfs_dentry *newCurrDE = (struct wfs_dentry *)new_dir_entry->data;
+    for (int i = 0; i < numDE; i++)
     {
-        memcpy(newCurrDentry, currDentry, sizeof(struct wfs_dentry));
-        newCurrDentry++;
-        currDentry++;
+        memcpy(newCurrDE, currDE, sizeof(struct wfs_dentry));
+        newCurrDE++;
+        currDE++;
     }
 
-    struct wfs_dentry *newDentry = (struct wfs_dentry *)newDirEntry->data + numDentries;
-    memcpy(newDentry->name, last, MAX_FILE_NAME_LEN);
-    newDentry->inode_number = nextInode;
-    // Update superblock and disk image size
-    sb->head += sizeof(struct wfs_log_entry) + newDirInode->size;
-    mapped_size += sizeof(struct wfs_log_entry) + newDirInode->size;
+    struct wfs_dentry *newDE = (struct wfs_dentry *)new_dir_entry->data + numDE;
+    memcpy(newDE->name, last_token, MAX_FILE_NAME_LEN);
+    newDE->inode_number = nextInode;
 
-    free(copyOfPath);
+    sb->head += sizeof(struct wfs_log_entry) + new_dir_inode->size;
+    mapped_size += sizeof(struct wfs_log_entry) + new_dir_inode->size;
 
-    return 0; // or appropriate error code
+    free(copied_path);
+
+    return 0;
 }
 
 static int wfs_mkdir(const char *path, mode_t mode)
@@ -255,49 +257,48 @@ static int wfs_mkdir(const char *path, mode_t mode)
 
 static int wfs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
-    struct wfs_inode *fileInode = get_inode_by_path(path);
-    if (fileInode == NULL)
+    struct wfs_inode *f_inode = get_inode_by_path(path);
+    if (f_inode == NULL)
     {
         return -ENOENT;
     }
-    struct wfs_log_entry *fileEntry = get_log_entry(fileInode->inode_number);
-    // invalidate old one
-    fileInode->deleted = 1;
-    // Append a new log entry with the updated file content
-    struct wfs_sb *sb = (struct wfs_sb *)mapped_disk;
-    struct wfs_log_entry *newEntry = (struct wfs_log_entry *)((char *)mapped_disk + sb->head);
-    struct wfs_inode *newInode = &newEntry->inode;
-    copy_data(newInode, fileInode, 2);
-    // copy over data
-    memcpy((void *)newEntry->data, (void *)fileEntry->data, fileInode->size);
-    // write new data to file
-    char *newData = newEntry->data;
-    newData += offset;
-    memcpy(newData, buf, size);
+    struct wfs_log_entry *f_entry = get_log_entry(f_inode->inode_number);
+    f_inode->deleted = 1;
 
-    // compute new size
-    unsigned int newWriteSize = (newData + size) - newEntry->data;
-    if (newWriteSize > fileInode->size)
+    // New log
+    struct wfs_sb *sb = (struct wfs_sb *)mapped_disk;
+    struct wfs_log_entry *new_entry = (struct wfs_log_entry *)((char *)mapped_disk + sb->head);
+    struct wfs_inode *new_inode = &new_entry->inode;
+    copy_data(new_inode, f_inode, 2);
+    memcpy((void *)new_entry->data, (void *)f_entry->data, f_inode->size);
+
+    // write data to file
+    char *new_data = new_entry->data;
+    new_data += offset;
+    memcpy(new_data, buf, size);
+
+    unsigned int new_size = (new_data + size) - new_entry->data;
+    if (new_size > f_inode->size)
     {
-        newInode->size = newWriteSize;
+        new_inode->size = new_size;
     }
     else
     {
-        newInode->size = fileInode->size;
+        new_inode->size = f_inode->size;
     }
 
-    sb->head += sizeof(struct wfs_inode) + newInode->size;
-    mapped_size += sizeof(struct wfs_inode) + newInode->size;
+    sb->head += sizeof(struct wfs_inode) + new_inode->size;
+    mapped_size += sizeof(struct wfs_inode) + new_inode->size;
 
-    return size; // return the number of bytes written or an error code
+    return size;
 }
 
 static int wfs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
 
-    struct wfs_log_entry *currEntry = get_log_entry(get_inode_by_path(path)->inode_number);
-    size = currEntry->inode.size;
-    memcpy(buf + offset, currEntry->data, sizeof(char) * size);
+    struct wfs_log_entry *curr_entry = get_log_entry(get_inode_by_path(path)->inode_number);
+    size = curr_entry->inode.size;
+    memcpy(buf + offset, curr_entry->data, sizeof(char) * size);
 
     return size;
 }
@@ -305,92 +306,82 @@ static int wfs_read(const char *path, char *buf, size_t size, off_t offset, stru
 static int wfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi)
 {
 
-    struct wfs_inode *dirInode;
-    struct wfs_log_entry *dirEntry;
-    if (strcmp(path, "/") == 0)
-    {
-        dirEntry = get_log_entry(0);
-        dirInode = &dirEntry->inode;
-    }
-    else
-    {
-        dirInode = get_inode_by_path(path);
-        dirEntry = get_log_entry(dirInode->inode_number);
-    }
+    struct wfs_inode *dir_inode;
+    struct wfs_log_entry *dir_entry;
 
-    if (dirInode == NULL)
+    dir_inode = get_inode_by_path(path);
+    dir_entry = get_log_entry(dir_inode->inode_number);
+
+    if (dir_inode == NULL)
     {
         return -ENOENT;
     }
 
-    // For each entry in the directory, use filler() to add it to the list
-    int numDentries = dirInode->size / sizeof(struct wfs_dentry);
-    struct wfs_dentry *currDentry = (struct wfs_dentry *)dirEntry->data;
-    for (int i = 0; i < numDentries; i++)
+    int numDE = dir_inode->size / sizeof(struct wfs_dentry);
+    struct wfs_dentry *curr_DE = (struct wfs_dentry *)dir_entry->data;
+    for (int i = 0; i < numDE; i++)
     {
-        filler(buf, currDentry->name, NULL, 0);
+        filler(buf, curr_DE->name, NULL, 0);
 
-        currDentry++;
+        curr_DE++;
     }
-    return 0; // or appropriate error code
+    return 0;
 }
 
 static int wfs_unlink(const char *path)
 {
 
     struct wfs_sb *sb = (struct wfs_sb *)mapped_disk;
-    struct wfs_inode *inodeToDelete = get_inode_by_path(path);
+    struct wfs_inode *inode_del = get_inode_by_path(path);
 
-    // Mark the file's inode as deleted
-    inodeToDelete->deleted = 1;
-    // Process directory path
-    char *copyOfPath = strdup(path);
-    char dirPath[MAX_PATH_LEN] = "/";
-    char *token = strtok(copyOfPath, "/");
-    char last[MAX_FILE_NAME_LEN] = "";
+
+    inode_del->deleted = 1;
+
+    char *copied_path = strdup(path);
+    char parent_path[MAX_PATH_LEN] = "/";
+    char *token = strtok(copied_path, "/");
+    char last_token[MAX_FILE_NAME_LEN] = "";
     if (token)
     {
-        strncpy(last, token, MAX_FILE_NAME_LEN - 1);
+        strncpy(last_token, token, MAX_FILE_NAME_LEN - 1);
     }
     while (token)
     {
         token = strtok(NULL, "/");
         if (token != NULL)
         {
-            strncat(dirPath, last, MAX_PATH_LEN - strlen(dirPath) - 1);
-            strncat(dirPath, "/", MAX_PATH_LEN - strlen(dirPath) - 1);
-            strncpy(last, token, MAX_FILE_NAME_LEN - 1);
+            strncat(parent_path, last_token, MAX_PATH_LEN - strlen(parent_path) - 1);
+            strncat(parent_path, "/", MAX_PATH_LEN - strlen(parent_path) - 1);
+            strncpy(last_token, token, MAX_FILE_NAME_LEN - 1);
         }
     }
 
-    struct wfs_log_entry *oldDirEntry = (strcmp(dirPath, "/") == 0) ? get_log_entry(0) : get_log_entry(get_inode_by_path(dirPath)->inode_number);
+    struct wfs_log_entry *old_dir_entry = (strcmp(parent_path, "/") == 0) ? get_log_entry(0) : get_log_entry(get_inode_by_path(parent_path)->inode_number);
 
-    struct wfs_inode *oldDirInode = &oldDirEntry->inode;
-    struct wfs_log_entry *newDirEntry = (struct wfs_log_entry *)((char *)mapped_disk + sb->head);
-    struct wfs_inode *newDirInode = &newDirEntry->inode;
-    copy_data(newDirInode, oldDirInode, 0);
+    struct wfs_inode *old_dir_inode = &old_dir_entry->inode;
+    struct wfs_log_entry *new_dir_entry = (struct wfs_log_entry *)((char *)mapped_disk + sb->head);
+    struct wfs_inode *new_dir_inode = &new_dir_entry->inode;
+    copy_data(new_dir_inode, old_dir_inode, 0);
 
-    // Copy directory entries excluding the deleted one
-    int numDentries = oldDirInode->size / sizeof(struct wfs_dentry);
-    struct wfs_dentry *currDentry = (struct wfs_dentry *)oldDirEntry->data;
-    struct wfs_dentry *newCurrDentry = (struct wfs_dentry *)newDirEntry->data;
-    for (int i = 0; i < numDentries; i++)
+    int numDE = old_dir_inode->size / sizeof(struct wfs_dentry);
+    struct wfs_dentry *currDE = (struct wfs_dentry *)old_dir_entry->data;
+    struct wfs_dentry *newCurrDE = (struct wfs_dentry *)new_dir_entry->data;
+    for (int i = 0; i < numDE; i++)
     {
-        if (currDentry->inode_number != inodeToDelete->inode_number)
+        if (currDE->inode_number != inode_del->inode_number)
         {
-            memcpy(newCurrDentry, currDentry, sizeof(struct wfs_dentry));
-            newCurrDentry++;
+            memcpy(newCurrDE, currDE, sizeof(struct wfs_dentry));
+            newCurrDE++;
         }
-        currDentry++;
+        currDE++;
     }
 
-    // Update superblock and disk image size
-    sb->head += sizeof(struct wfs_log_entry) + newDirInode->size;
-    mapped_size += sizeof(struct wfs_log_entry) + newDirInode->size;
+    sb->head += sizeof(struct wfs_log_entry) + new_dir_inode->size;
+    mapped_size += sizeof(struct wfs_log_entry) + new_dir_inode->size;
 
-    free(copyOfPath);
+    free(copied_path);
 
-    return 0; // Success
+    return 0;
 }
 
 static struct fuse_operations wfs_oper = {
