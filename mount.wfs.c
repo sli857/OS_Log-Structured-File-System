@@ -9,57 +9,65 @@
 #include "time.h"
 #include <stdbool.h>
 
-FILE *disk_image = NULL;
+FILE *disk = NULL;
 const char *disk_path;
-void *mapped_disk_image = NULL;
-size_t mapped_disk_image_size;
+void *mapped_disk = NULL;
+size_t mapped_size;
 
+// helper to copy inode, under desired condition
 void copy_data(struct wfs_inode *newInode, struct wfs_inode *fileInode, int condition)
 {
-    newInode->inode_number = fileInode->inode_number;
+
+    memcpy(newInode, fileInode, sizeof(struct wfs_inode));
+
+    // edit fields specifically as needed
     newInode->deleted = 0;
-    newInode->mode = fileInode->mode;
-    newInode->uid = fileInode->uid;
-    newInode->gid = fileInode->gid;
-    newInode->flags = fileInode->flags;
     newInode->atime = time(NULL);
     newInode->ctime = time(NULL);
     newInode->mtime = time(NULL);
 
-    // 2 indicate: no size modification needed
-    if (condition == 2)
+    // edit size
+    switch (condition)
     {
+    // 0: write
+    case 0:
+        return;
+
+    // 1: mkdir
+    case 1:
+        newInode->size = fileInode->size + sizeof(struct wfs_dentry);
+        return;
+
+    // 2: unlink
+    case 2:
+        newInode->size = fileInode->size - sizeof(struct wfs_dentry);
         return;
     }
-
-    newInode->size = condition == 1 ? fileInode->size + sizeof(struct wfs_dentry) : fileInode->size - sizeof(struct wfs_dentry);
 }
 
-// Retrieves a log entry from the memory-mapped disk image.
-// retrieves root entry by inode_number = 0
-struct wfs_log_entry *get_entry(int inode_number)
+// get a log entry by inode_number; get root entry by inode_number = 0
+struct wfs_log_entry *get_log_entry(int inode_number)
 {
-    char *currAddr = (char *)mapped_disk_image + sizeof(struct wfs_sb);
-    struct wfs_sb *sb = (struct wfs_sb *)mapped_disk_image;
-    struct wfs_log_entry *actualInode = NULL;
-    while (currAddr < ((char *)mapped_disk_image + sb->head))
+    char *curr_addr = (char *)mapped_disk + sizeof(struct wfs_sb);
+    struct wfs_sb *sb = (struct wfs_sb *)mapped_disk;
+    struct wfs_log_entry *target_node = NULL;
+    while (curr_addr < ((char *)mapped_disk + sb->head))
     {
-        struct wfs_log_entry *logEntry = (struct wfs_log_entry *)currAddr;
+        struct wfs_log_entry *curr_log_entry = (struct wfs_log_entry *)curr_addr;
 
-        if (logEntry->inode.inode_number == inode_number)
+        if (curr_log_entry->inode.inode_number == inode_number)
         {
-            actualInode = logEntry;
+            target_node = curr_log_entry;
         }
 
-        currAddr += sizeof(struct wfs_inode) + logEntry->inode.size;
+        curr_addr += sizeof(struct wfs_inode) + curr_log_entry->inode.size;
     }
 
-    return actualInode;
+    return target_node;
 }
 
-struct wfs_dentry *find_dentry(struct wfs_log_entry *entry, const char *name)
+struct wfs_dentry *get_dentry(struct wfs_log_entry *entry, const char *name)
 {
-
     int numDentries = entry->inode.size / sizeof(struct wfs_dentry);
     if (numDentries == 0)
     {
@@ -79,32 +87,33 @@ struct wfs_dentry *find_dentry(struct wfs_log_entry *entry, const char *name)
     return NULL;
 }
 
-struct wfs_inode *find_inode_by_path(const char *path)
+struct wfs_inode *get_inode_by_path(const char *path)
 {
 
-    struct wfs_log_entry *logEntry = get_entry(0);
-    char copyOfPath[strlen(path)];
-    strcpy(copyOfPath, path);
-    char *token = strtok(copyOfPath, "/");
+    struct wfs_log_entry *logEntry = get_log_entry(0);
+    char *dup_path = strdup(path);
+    char *token = strtok(dup_path, "/");
 
     while (token)
     {
         int numDentries = logEntry->inode.size / sizeof(struct wfs_dentry);
-        struct wfs_dentry *currDentry = find_dentry(logEntry, token);
-        if (currDentry == NULL || numDentries == 0)
-        {
+        if (numDentries == 0)
             return NULL;
-        }
+
+        struct wfs_dentry *currDentry = get_dentry(logEntry, token);
+        if (currDentry == NULL)
+            return NULL;
+
         token = strtok(NULL, "/");
 
         // If it was the last token in the path, return the corresponding inode
         if (token == NULL)
         {
-            return &(get_entry(currDentry->inode_number)->inode);
+            return &(get_log_entry(currDentry->inode_number)->inode);
         }
         else
         {
-            logEntry = get_entry(currDentry->inode_number);
+            logEntry = get_log_entry(currDentry->inode_number);
         }
     }
 
@@ -114,44 +123,34 @@ struct wfs_inode *find_inode_by_path(const char *path)
 // Fuse below:
 static int wfs_getattr(const char *path, struct stat *stbuf)
 {
-    memset(stbuf, 0, sizeof(struct stat));
-
-    if (strcmp(path, "/") == 0)
+    struct wfs_inode *inode = get_inode_by_path(path);
+    if (inode == NULL)
     {
-        stbuf->st_mode = S_IFDIR;
-        stbuf->st_nlink = 2;
+        return -ENOENT;
     }
-    else
-    {
-        struct wfs_inode *inode = find_inode_by_path(path);
-        if (!inode)
-        {
-            return -ENOENT;
-        }
 
-        stbuf->st_mode = inode->mode;
-        stbuf->st_nlink = inode->links;
-        stbuf->st_size = inode->size;
-        stbuf->st_uid = inode->uid;
-        stbuf->st_gid = inode->gid;
-        stbuf->st_atime = inode->atime;
-        stbuf->st_mtime = inode->mtime;
-        stbuf->st_ctime = inode->ctime;
-    }
+    stbuf->st_mode = inode->mode;
+    stbuf->st_nlink = inode->links;
+    stbuf->st_size = inode->size;
+    stbuf->st_uid = inode->uid;
+    stbuf->st_gid = inode->gid;
+    stbuf->st_atime = inode->atime;
+    stbuf->st_mtime = inode->mtime;
+    stbuf->st_ctime = inode->ctime;
 
     return 0;
 }
 
 static int wfs_mknod(const char *path, mode_t mode, dev_t rdev)
 {
-    struct wfs_inode *inode = find_inode_by_path(path);
+    struct wfs_inode *inode = get_inode_by_path(path);
     if (inode != NULL)
     {
         return -EEXIST;
     }
 
-    struct wfs_sb *sb = (struct wfs_sb *)mapped_disk_image;
-    struct wfs_log_entry *newLogEntry = (struct wfs_log_entry *)((char *)mapped_disk_image + sb->head);
+    struct wfs_sb *sb = (struct wfs_sb *)mapped_disk;
+    struct wfs_log_entry *newLogEntry = (struct wfs_log_entry *)((char *)mapped_disk + sb->head);
     struct wfs_inode *newInode = &newLogEntry->inode;
     int nextInode = -1;
     int nextInodeNum = 1;
@@ -160,13 +159,12 @@ static int wfs_mknod(const char *path, mode_t mode, dev_t rdev)
     while (nextInodeNum <= UINT32_MAX)
     {
         bool inodeAvailable = true;
-        char *logEntryAddr = (char *)mapped_disk_image + sizeof(struct wfs_sb);
+        char *logEntryAddr = (char *)mapped_disk + sizeof(struct wfs_sb);
 
         // Traverse each log entry to check if the inode number is in use
-        while (logEntryAddr - (char *)mapped_disk_image < sb->head)
+        while (logEntryAddr - (char *)mapped_disk < sb->head)
         {
             struct wfs_log_entry *logEntry = (struct wfs_log_entry *)logEntryAddr;
-
             if (logEntry->inode.inode_number == nextInodeNum && logEntry->inode.deleted == 0)
             {
                 inodeAvailable = false;
@@ -199,7 +197,7 @@ static int wfs_mknod(const char *path, mode_t mode, dev_t rdev)
 
     // Update superblock and disk image size
     sb->head += sizeof(struct wfs_inode);
-    mapped_disk_image_size += sizeof(struct wfs_inode);
+    mapped_size += sizeof(struct wfs_inode);
 
     char *copyOfPath = strdup(path);
     char dirPath[MAX_PATH_LEN] = "/";
@@ -220,10 +218,10 @@ static int wfs_mknod(const char *path, mode_t mode, dev_t rdev)
         }
     }
 
-    struct wfs_log_entry *oldDirEntry = (strcmp(dirPath, "/") == 0) ? get_entry(0) : get_entry(find_inode_by_path(dirPath)->inode_number);
+    struct wfs_log_entry *oldDirEntry = (strcmp(dirPath, "/") == 0) ? get_log_entry(0) : get_log_entry(get_inode_by_path(dirPath)->inode_number);
 
     struct wfs_inode *oldDirInode = &oldDirEntry->inode;
-    struct wfs_log_entry *newDirEntry = (struct wfs_log_entry *)((char *)mapped_disk_image + sb->head);
+    struct wfs_log_entry *newDirEntry = (struct wfs_log_entry *)((char *)mapped_disk + sb->head);
     struct wfs_inode *newDirInode = &newDirEntry->inode;
     copy_data(newDirInode, oldDirInode, 1);
 
@@ -243,7 +241,7 @@ static int wfs_mknod(const char *path, mode_t mode, dev_t rdev)
     newDentry->inode_number = nextInode;
     // Update superblock and disk image size
     sb->head += sizeof(struct wfs_log_entry) + newDirInode->size;
-    mapped_disk_image_size += sizeof(struct wfs_log_entry) + newDirInode->size;
+    mapped_size += sizeof(struct wfs_log_entry) + newDirInode->size;
 
     free(copyOfPath);
 
@@ -257,17 +255,17 @@ static int wfs_mkdir(const char *path, mode_t mode)
 
 static int wfs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
-    struct wfs_inode *fileInode = find_inode_by_path(path);
+    struct wfs_inode *fileInode = get_inode_by_path(path);
     if (fileInode == NULL)
     {
         return -ENOENT;
     }
-    struct wfs_log_entry *fileEntry = get_entry(fileInode->inode_number);
+    struct wfs_log_entry *fileEntry = get_log_entry(fileInode->inode_number);
     // invalidate old one
     fileInode->deleted = 1;
     // Append a new log entry with the updated file content
-    struct wfs_sb *sb = (struct wfs_sb *)mapped_disk_image;
-    struct wfs_log_entry *newEntry = (struct wfs_log_entry *)((char *)mapped_disk_image + sb->head);
+    struct wfs_sb *sb = (struct wfs_sb *)mapped_disk;
+    struct wfs_log_entry *newEntry = (struct wfs_log_entry *)((char *)mapped_disk + sb->head);
     struct wfs_inode *newInode = &newEntry->inode;
     copy_data(newInode, fileInode, 2);
     // copy over data
@@ -289,7 +287,7 @@ static int wfs_write(const char *path, const char *buf, size_t size, off_t offse
     }
 
     sb->head += sizeof(struct wfs_inode) + newInode->size;
-    mapped_disk_image_size += sizeof(struct wfs_inode) + newInode->size;
+    mapped_size += sizeof(struct wfs_inode) + newInode->size;
 
     return size; // return the number of bytes written or an error code
 }
@@ -297,7 +295,7 @@ static int wfs_write(const char *path, const char *buf, size_t size, off_t offse
 static int wfs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
 
-    struct wfs_log_entry *currEntry = get_entry(find_inode_by_path(path)->inode_number);
+    struct wfs_log_entry *currEntry = get_log_entry(get_inode_by_path(path)->inode_number);
     size = currEntry->inode.size;
     memcpy(buf + offset, currEntry->data, sizeof(char) * size);
 
@@ -311,13 +309,13 @@ static int wfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
     struct wfs_log_entry *dirEntry;
     if (strcmp(path, "/") == 0)
     {
-        dirEntry = get_entry(0);
+        dirEntry = get_log_entry(0);
         dirInode = &dirEntry->inode;
     }
     else
     {
-        dirInode = find_inode_by_path(path);
-        dirEntry = get_entry(dirInode->inode_number);
+        dirInode = get_inode_by_path(path);
+        dirEntry = get_log_entry(dirInode->inode_number);
     }
 
     if (dirInode == NULL)
@@ -340,8 +338,8 @@ static int wfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
 static int wfs_unlink(const char *path)
 {
 
-    struct wfs_sb *sb = (struct wfs_sb *)mapped_disk_image;
-    struct wfs_inode *inodeToDelete = find_inode_by_path(path);
+    struct wfs_sb *sb = (struct wfs_sb *)mapped_disk;
+    struct wfs_inode *inodeToDelete = get_inode_by_path(path);
 
     // Mark the file's inode as deleted
     inodeToDelete->deleted = 1;
@@ -365,10 +363,10 @@ static int wfs_unlink(const char *path)
         }
     }
 
-    struct wfs_log_entry *oldDirEntry = (strcmp(dirPath, "/") == 0) ? get_entry(0) : get_entry(find_inode_by_path(dirPath)->inode_number);
+    struct wfs_log_entry *oldDirEntry = (strcmp(dirPath, "/") == 0) ? get_log_entry(0) : get_log_entry(get_inode_by_path(dirPath)->inode_number);
 
     struct wfs_inode *oldDirInode = &oldDirEntry->inode;
-    struct wfs_log_entry *newDirEntry = (struct wfs_log_entry *)((char *)mapped_disk_image + sb->head);
+    struct wfs_log_entry *newDirEntry = (struct wfs_log_entry *)((char *)mapped_disk + sb->head);
     struct wfs_inode *newDirInode = &newDirEntry->inode;
     copy_data(newDirInode, oldDirInode, 0);
 
@@ -388,7 +386,7 @@ static int wfs_unlink(const char *path)
 
     // Update superblock and disk image size
     sb->head += sizeof(struct wfs_log_entry) + newDirInode->size;
-    mapped_disk_image_size += sizeof(struct wfs_log_entry) + newDirInode->size;
+    mapped_size += sizeof(struct wfs_log_entry) + newDirInode->size;
 
     free(copyOfPath);
 
@@ -416,22 +414,22 @@ int main(int argc, char *argv[])
     disk_path = argv[argc - 2];
     char *mount_point = argv[argc - 1];
 
-    disk_image = fopen(disk_path, "rb+");
-    if (!disk_image)
+    disk = fopen(disk_path, "rb+");
+    if (!disk)
     {
         perror("Unable to open disk image");
         return 1;
     }
 
-    fseek(disk_image, 0, SEEK_END);
-    mapped_disk_image_size = ftell(disk_image);
-    fseek(disk_image, 0, SEEK_SET);
+    fseek(disk, 0, SEEK_END);
+    mapped_size = ftell(disk);
+    fseek(disk, 0, SEEK_SET);
 
-    mapped_disk_image = mmap(NULL, mapped_disk_image_size, PROT_READ | PROT_WRITE, MAP_SHARED, fileno(disk_image), 0);
-    if (mapped_disk_image == MAP_FAILED)
+    mapped_disk = mmap(NULL, mapped_size, PROT_READ | PROT_WRITE, MAP_SHARED, fileno(disk), 0);
+    if (mapped_disk == MAP_FAILED)
     {
         perror("Error mapping disk image");
-        fclose(disk_image);
+        fclose(disk);
         return 1;
     }
 
@@ -444,8 +442,8 @@ int main(int argc, char *argv[])
     fuse_argv[fuse_argc - 1] = mount_point;
 
     fuse_main(fuse_argc, fuse_argv, &wfs_oper, NULL);
-    munmap(mapped_disk_image, mapped_disk_image_size);
-    fclose(disk_image);
+    munmap(mapped_disk, mapped_size);
+    fclose(disk);
 
     return 0;
 }
